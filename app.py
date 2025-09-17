@@ -8,10 +8,6 @@ import json
 from datetime import datetime
 import logging
 import time
-
-# Set up HuggingFace cache environment variables
-os.environ['HF_HOME'] = os.path.join(os.getcwd(), '.huggingface_cache')
-os.environ['TRANSFORMERS_CACHE'] = os.path.join(os.getcwd(), '.huggingface_cache')
 from model_pipeline import ObjectCounter
 from monitoring import metrics_collector
 from few_shot_learning import few_shot_learner
@@ -184,14 +180,35 @@ def count_objects():
                 ]
             }), 403
 
-        # Process image with AI pipeline
+        # Save uploaded file temporarily
+        filename = secure_filename(fileobj.filename)
+        if not filename:
+            filename = f"upload_{int(time.time())}.jpg"
+        
+        temp_file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+        fileobj.save(temp_file_path)
+        
+        # Process image with AI pipeline using the file path
         try:
-            result = object_counter.count_objects_from_bytes(image_bytes, item_type=item_type)
+            result = object_counter.count_objects(temp_file_path, target_item_type=item_type)
         except Exception as e:
             if "UnidentifiedImageError" in str(e) or "cannot identify image file" in str(e):
+                # Clean up temp file
+                if os.path.exists(temp_file_path):
+                    os.remove(temp_file_path)
                 return jsonify({'error': 'Invalid image file format'}), 400
             else:
+                # Clean up temp file
+                if os.path.exists(temp_file_path):
+                    os.remove(temp_file_path)
                 raise e
+        
+        # Clean up temporary file
+        try:
+            if os.path.exists(temp_file_path):
+                os.remove(temp_file_path)
+        except Exception as e:
+            logger.warning(f"Failed to clean up temp file {temp_file_path}: {e}")
 
         # Create response wrapper function
         def make_count_response(result_dict, db_record=None, processing_time=None, item_type=None):
@@ -872,3 +889,4 @@ if __name__ == '__main__':
     # Run the application
     port = int(os.environ.get('API_PORT', 5001))
     app.run(debug=True, host='0.0.0.0', port=port)
+
