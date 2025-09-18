@@ -86,61 +86,69 @@ def count_objects():
     - JSON response with count results
     """
     start = time.time()
-    raw_item_type = request.form.get('item_type', None)
-    fileobj = request.files.get('image')
-    image_bytes = fileobj.read() if fileobj else None
-    
-    # Run safety pre-check immediately before any validation
-    # Check text safety with raw item type and description
-    text_to_check = f"{raw_item_type} {request.form.get('description', '')}"
-    safety_violations = safety_module.check_text_safety(text_to_check)
-    if safety_violations:
-        # Log violations and return blocked response
-        for violation in safety_violations:
-            safety_module.log_violation(violation, "uploaded_image")
-        reasons = [v.violation_type for v in safety_violations]
-        evidence = {"violations": [{"reason": v.violation_type, "details": v.evidence} for v in safety_violations]}
-        violations = [{"type": v.violation_type, "reason": v.violation_type, "details": v.evidence} for v in safety_violations]
-        return jsonify({"status":"blocked","reasons": reasons, "evidence": evidence, "violations": violations}), 403
-
-    # only then normalize and validate item_type
-    if not raw_item_type:
-        return jsonify({"error": "No item type specified"}), 400
-    
-    item_type = normalize_item_type(raw_item_type)
-    if item_type is None:
-        return jsonify({"error": "Invalid or missing item type"}), 400
-
-    if fileobj is None:
-        return jsonify({"error": "No image file provided"}), 400
-
-    # Validate file type
-    if not allowed_file(fileobj.filename):
-        return jsonify({
-            'error': f'Invalid file type. Allowed types: {list(ALLOWED_EXTENSIONS)}'
-        }), 400
-
     try:
-        # Safety checks before processing (redundant but kept for compatibility)
-        safety_violations = []
-        
-        # Check text safety (item_type and any additional text)
-        text_to_check = f"{item_type} {request.form.get('description', '')}"
-        text_violations = safety_module.check_text_safety(text_to_check)
-        safety_violations.extend(text_violations)
-        
-        # If safety violations detected, block the request
+        raw_item_type = request.form.get('item_type', None)
+        fileobj = request.files.get('image')
+
+        # Run safety pre-check immediately before any validation (TEXT ONLY)
+        text_to_check = f"{raw_item_type} {request.form.get('description', '')}"
+        safety_violations = safety_module.check_text_safety(text_to_check)
         if safety_violations:
-            # Log violations
             for violation in safety_violations:
                 safety_module.log_violation(violation, "uploaded_image")
-                # Record blocked request metrics
+            reasons = [v.violation_type for v in safety_violations]
+            evidence = {
+                "violations": [
+                    {"reason": v.violation_type, "details": v.evidence}
+                    for v in safety_violations
+                ]
+            }
+            violations = [
+                {"type": v.violation_type, "reason": v.violation_type, "details": v.evidence}
+                for v in safety_violations
+            ]
+            return jsonify({"status": "blocked", "reasons": reasons, "evidence": evidence, "violations": violations}), 403
+
+        # Validate item_type
+        if not raw_item_type:
+            return jsonify({"error": "No item type specified"}), 400
+        item_type = normalize_item_type(raw_item_type)
+        if item_type is None:
+            return jsonify({"error": "Invalid or missing item type"}), 400
+
+        # Validate file presence and extension
+        if fileobj is None or fileobj.filename == '':
+            return jsonify({"error": "No image file provided"}), 400
+
+        if not allowed_file(fileobj.filename):
+            return jsonify({
+                'error': f'Invalid file type. Allowed types: {list(ALLOWED_EXTENSIONS)}'
+            }), 400
+
+        # IMPORTANT: Do NOT read() the stream before saving (avoids empty file issue)
+        filename = secure_filename(fileobj.filename) or f"upload_{int(time.time())}.jpg"
+        temp_file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+        fileobj.save(temp_file_path)
+
+        # Quick sanity check that it's a real image
+        try:
+            from PIL import Image as _PIL_Image
+            with _PIL_Image.open(temp_file_path) as _im:
+                _im.verify()
+        except Exception:
+            if os.path.exists(temp_file_path):
+                os.remove(temp_file_path)
+            return jsonify({'error': 'Invalid image file format'}), 400
+
+        # Secondary text safety (kept for backward compatibility)
+        text_violations = safety_module.check_text_safety(f"{item_type} {request.form.get('description', '')}")
+        if text_violations:
+            for violation in text_violations:
+                safety_module.log_violation(violation, "uploaded_image")
                 metrics_collector.record_blocked_request(
                     reason=violation.violation_type,
                     pipeline_version="1.0.0"
                 )
-            
-            # Prepare evidence for response
             evidence = {
                 "violations": [
                     {
@@ -148,14 +156,11 @@ def count_objects():
                         "reason": v.reason,
                         "confidence": v.confidence,
                         "evidence": v.evidence
-                    }
-                    for v in safety_violations
+                    } for v in text_violations
                 ],
                 "timestamp": time.time(),
                 "image_path": "uploaded_image"
             }
-            
-            # Save evidence file
             evidence_file = os.path.join(
                 safety_module.evidence_dir,
                 f"blocked_request_{int(time.time())}.json"
@@ -163,9 +168,9 @@ def count_objects():
             try:
                 with open(evidence_file, 'w') as f:
                     json.dump(evidence, f, indent=2)
-            except Exception as e:
-                logger.error(f"Failed to save evidence file: {e}")
-            
+            except Exception as _e:
+                logger.error(f"Failed to save evidence file: {_e}")
+
             return jsonify({
                 'error': 'Request blocked due to safety policy violation',
                 'reason': 'Military vehicle counting detected',
@@ -175,44 +180,32 @@ def count_objects():
                         'type': v.violation_type,
                         'reason': v.reason,
                         'confidence': v.confidence
-                    }
-                    for v in safety_violations
+                    } for v in text_violations
                 ]
             }), 403
 
-        # Save uploaded file temporarily
-        filename = secure_filename(fileobj.filename)
-        if not filename:
-            filename = f"upload_{int(time.time())}.jpg"
-        
-        temp_file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-        fileobj.save(temp_file_path)
-        
-        # Process image with AI pipeline using the file path
+        # Process image with AI pipeline using the saved file path
         try:
             result = object_counter.count_objects(temp_file_path, target_item_type=item_type)
         except Exception as e:
             if "UnidentifiedImageError" in str(e) or "cannot identify image file" in str(e):
-                # Clean up temp file
                 if os.path.exists(temp_file_path):
                     os.remove(temp_file_path)
                 return jsonify({'error': 'Invalid image file format'}), 400
             else:
-                # Clean up temp file
                 if os.path.exists(temp_file_path):
                     os.remove(temp_file_path)
-                raise e
-        
-        # Clean up temporary file
+                raise
+
+        # Clean up the temporary file
         try:
             if os.path.exists(temp_file_path):
                 os.remove(temp_file_path)
         except Exception as e:
             logger.warning(f"Failed to clean up temp file {temp_file_path}: {e}")
 
-        # Create response wrapper function
+        # Response shaping helper
         def make_count_response(result_dict, db_record=None, processing_time=None, item_type=None):
-            """Ensure response contains id and total fields"""
             count = int(result_dict.get("count", 0))
             response = {
                 "id": None,
@@ -220,7 +213,7 @@ def count_objects():
                 "count": count,
                 "item_type": item_type,
                 "confidence": result_dict.get("confidence", 0.0),
-                "confidence_score": result_dict.get("confidence", 0.0),  # Also include confidence_score for compatibility
+                "confidence_score": result_dict.get("confidence", 0.0),  # keep both fields
                 "processing_time": processing_time,
                 "details": result_dict.get("details", {}),
                 "meta": result_dict.get("meta", {})
@@ -229,12 +222,10 @@ def count_objects():
                 response["id"] = db_record.id
             return response
 
-        # Calculate processing time
         processing_time = time.time() - start
-        
+
+        # Persist to DB
         try:
-            from datetime import datetime
-            import uuid
             db_res = CountingResult(
                 id=str(uuid.uuid4()),
                 timestamp=datetime.utcnow(),
@@ -247,20 +238,20 @@ def count_objects():
             )
             db.session.add(db_res)
             db.session.commit()
-            db.session.refresh(db_res)  # Get the ID
+            db.session.refresh(db_res)
         except Exception:
             current_app.logger.exception("DB write failed")
             db_res = None
 
+        # Metrics
         response_time = time.time() - start
         try:
             metrics_collector.record_request('/api/count', 'POST', 200, response_time, pipeline_version="1.0.0")
-            # Record counting result metrics
             metrics_collector.record_counting_result(result, pipeline_version="1.0.0")
         except Exception:
             current_app.logger.exception("metrics.record_request failed")
 
-        # Use wrapper to ensure proper response format
+        # Build response
         response_data = make_count_response(result, db_res, response_time, item_type)
         return jsonify(response_data), 200
 
@@ -271,7 +262,7 @@ def count_objects():
             metrics_collector.record_request('/api/count', 'POST', 500, response_time, pipeline_version="1.0.0")
         except Exception:
             current_app.logger.exception("metrics.record_request failed in exception path")
-        return jsonify({"error":"internal_server_error","details":str(e)}), 500
+        return jsonify({"error": "internal_server_error", "details": str(e)}), 500
 
 @app.route('/api/correct', methods=['GET', 'POST'])
 def correct_count():
@@ -338,8 +329,6 @@ def correct_count():
     except Exception as e:
         logger.error(f"Error correcting count: {str(e)}")
         return jsonify({'error': 'Internal server error'}), 500
-
-# Add debug logging to the existing correct_count function
 
 @app.route('/api/results', methods=['GET'])
 def get_results():
@@ -889,4 +878,3 @@ if __name__ == '__main__':
     # Run the application
     port = int(os.environ.get('API_PORT', 5001))
     app.run(debug=True, host='0.0.0.0', port=port)
-
